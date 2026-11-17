@@ -17,3 +17,8 @@ A RuneLite skilling pace timer and session logger for Old School RuneScape.
 ## Controls
 * **Move Overlay:** Hold `Alt` and drag the on-screen timer box anywhere on your screen.
 * **Quick Actions:** Right-click the on-screen timer box to **Save & Reset**, **Pause/Resume**, or **Reset**.
+
+
+
+
+Made by Strafeous : )
