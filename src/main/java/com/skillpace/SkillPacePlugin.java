@@ -3,14 +3,12 @@ package com.skillpace;
 import com.google.inject.Provides;
 import java.awt.BasicStroke;
 import java.awt.Color;
-import java.awt.Desktop;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
-import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
-import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -25,10 +23,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import javax.inject.Inject;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.AnimationID;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -44,7 +45,6 @@ import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.StatChanged;
-import net.runelite.client.RuneLite;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.OverlayMenuClicked;
@@ -55,10 +55,14 @@ import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.ui.overlay.OverlayMenuEntry;
+import net.runelite.client.util.Filepath;
 import net.runelite.client.util.QuantityFormatter;
 
+@Slf4j
 @PluginDescriptor(
         name = "Strafeous' Pace",
+        internalName = "strafeous-pace",
+        legacyDataDirectory = "strafeous-pace",
         description = "Starts on first swing/action, auto-saves on AFK/logout/skill switch, and exports session logs",
         tags = {"timer", "stopwatch", "skilling", "pace", "tracker", "logs", "mining", "hunter", "strafeous"}
 )
@@ -160,6 +164,7 @@ public class SkillPacePlugin extends Plugin
 
     private SkillPacePanel panel;
     private NavigationButton navButton;
+    private ScheduledExecutorService ioExecutor;
 
     private final Map<Skill, Integer> previousXp = new HashMap<>();
     private final Map<Integer, Integer> previousInventory = new HashMap<>();
@@ -201,6 +206,8 @@ public class SkillPacePlugin extends Plugin
     @Override
     protected void startUp()
     {
+        ioExecutor = Executors.newSingleThreadScheduledExecutor();
+
         overlay.getMenuEntries().add(new OverlayMenuEntry(MenuAction.RUNELITE_OVERLAY, SAVE_RESET_ACTION, PLUGIN_TITLE));
         overlay.getMenuEntries().add(new OverlayMenuEntry(MenuAction.RUNELITE_OVERLAY, PAUSE_ACTION, PLUGIN_TITLE));
         overlay.getMenuEntries().add(new OverlayMenuEntry(MenuAction.RUNELITE_OVERLAY, RESET_ACTION, PLUGIN_TITLE));
@@ -234,6 +241,12 @@ public class SkillPacePlugin extends Plugin
         previousXp.clear();
         previousInventory.clear();
         sessionLoot.clear();
+
+        if (ioExecutor != null)
+        {
+            ioExecutor.shutdownNow();
+            ioExecutor = null;
+        }
     }
 
     private BufferedImage createClockIcon()
@@ -256,7 +269,6 @@ public class SkillPacePlugin extends Plugin
         g.dispose();
         return img;
     }
-
     @Subscribe
     public void onGameStateChanged(GameStateChanged event)
     {
@@ -654,7 +666,6 @@ public class SkillPacePlugin extends Plugin
                 return "gained";
         }
     }
-
     public String getPastTenseTitleVerb()
     {
         if (activeSkill == null)
@@ -685,7 +696,6 @@ public class SkillPacePlugin extends Plugin
                 return "Trained " + activeSkill.getName();
         }
     }
-
     public void saveCurrentSession()
     {
         Duration elapsed = getElapsed();
@@ -757,31 +767,41 @@ public class SkillPacePlugin extends Plugin
 
     private void appendToPermanentLogFile(String skill, String date, String timeLoc, String items, String xp, String xpHr, String extra, String loot)
     {
-        try
+        StringBuilder block = new StringBuilder();
+        block.append("========================================\n");
+        block.append("[").append(LocalDateTime.now().format(STAMP_FORMAT)).append("] Trained ").append(skill).append("\n");
+        block.append("Date: ").append(date).append("\n");
+        block.append("Session: ").append(timeLoc).append("\n");
+        block.append("Output: ").append(items).append("\n");
+        block.append("XP: ").append(xp).append(" (").append(xpHr).append(")\n");
+        block.append("Details: ").append(extra).append("\n");
+        if (!loot.isEmpty())
         {
-            File dir = new File(RuneLite.RUNELITE_DIR, "strafeous-pace");
-            if (!dir.exists())
-            {
-                dir.mkdirs();
-            }
-            File logFile = new File(dir, "strafeous-pace-log.txt");
-            try (PrintWriter out = new PrintWriter(new FileWriter(logFile, true)))
-            {
-                out.println("========================================");
-                out.println("[" + LocalDateTime.now().format(STAMP_FORMAT) + "] Trained " + skill);
-                out.println("Date: " + date);
-                out.println("Session: " + timeLoc);
-                out.println("Output: " + items);
-                out.println("XP: " + xp + " (" + xpHr + ")");
-                out.println("Details: " + extra);
-                if (!loot.isEmpty())
-                {
-                    out.println("Items: " + loot);
-                }
-            }
+            block.append("Items: ").append(loot).append("\n");
         }
-        catch (IOException ignored)
+
+        String payload = block.toString();
+        Runnable writeTask = () ->
         {
+            try
+            {
+                Filepath dir = getPluginDirectory();
+                Filepath logFile = dir.joinSegment("strafeous-pace-log.txt");
+                logFile.write(payload.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            }
+            catch (IOException ex)
+            {
+                log.debug("Failed to append Strafeous' Pace session log", ex);
+            }
+        };
+
+        if (ioExecutor != null && !ioExecutor.isShutdown())
+        {
+            ioExecutor.execute(writeTask);
+        }
+        else
+        {
+            writeTask.run();
         }
     }
 
@@ -794,75 +814,86 @@ public class SkillPacePlugin extends Plugin
             return;
         }
 
-        try
+        StringBuilder report = new StringBuilder();
+        report.append("STRAFEOUS' PACE - SKILLING SESSION LOG\n");
+        report.append("Exported: ").append(LocalDateTime.now().format(STAMP_FORMAT)).append("\n");
+        report.append("Total Saved Runs: ").append(entries.size()).append("\n");
+        report.append("====================================================\n\n");
+
+        for (String raw : entries)
         {
-            String userHome = System.getProperty("user.home");
-            File desktop = new File(userHome, "Desktop");
-            if (!desktop.exists())
+            String[] parts = raw.split("\\|", -1);
+            if (parts.length < 8)
             {
-                desktop = new File(userHome);
+                continue;
             }
-            File exportFile = new File(desktop, "Strafeous-Pace-Export-" + LocalDate.now().format(FILE_DATE_FORMAT) + ".txt");
+            report.append("Trained ").append(parts[0]).append(" (").append(parts[1]).append(")\n");
+            report.append("  ").append(parts[2]).append("\n");
+            report.append("  ").append(parts[3]).append("\n");
+            report.append("  XP: ").append(parts[4]).append(" | Avg: ").append(parts[5]).append("\n");
+            report.append("  ").append(parts[6]).append("\n");
 
-            try (PrintWriter out = new PrintWriter(new FileWriter(exportFile, false)))
+            if (parts.length >= 9 && !parts[8].isEmpty())
             {
-                out.println("STRAFEOUS' PACE - SKILLING SESSION LOG");
-                out.println("Exported: " + LocalDateTime.now().format(STAMP_FORMAT));
-                out.println("Total Saved Runs: " + entries.size());
-                out.println("====================================================");
-                out.println();
-
-                for (String raw : entries)
+                StringBuilder itemLine = new StringBuilder("  Items: ");
+                String[] tokens = parts[8].split(",");
+                for (int i = 0; i < tokens.length; i++)
                 {
-                    String[] parts = raw.split("\\|", -1);
-                    if (parts.length < 8)
+                    String[] kv = tokens[i].split(":");
+                    if (kv.length == 2)
                     {
-                        continue;
-                    }
-                    out.println("Trained " + parts[0] + " (" + parts[1] + ")");
-                    out.println("  " + parts[2]);
-                    out.println("  " + parts[3]);
-                    out.println("  XP: " + parts[4] + " | Avg: " + parts[5]);
-                    out.println("  " + parts[6]);
-
-                    if (parts.length >= 9 && !parts[8].isEmpty())
-                    {
-                        StringBuilder itemLine = new StringBuilder("  Items: ");
-                        String[] tokens = parts[8].split(",");
-                        for (int i = 0; i < tokens.length; i++)
+                        try
                         {
-                            String[] kv = tokens[i].split(":");
-                            if (kv.length == 2)
+                            int id = Integer.parseInt(kv[0]);
+                            int qty = Integer.parseInt(kv[1]);
+                            if (i > 0)
                             {
-                                try
-                                {
-                                    int id = Integer.parseInt(kv[0]);
-                                    int qty = Integer.parseInt(kv[1]);
-                                    if (i > 0)
-                                    {
-                                        itemLine.append(", ");
-                                    }
-                                    itemLine.append(itemManager.getItemComposition(id).getName()).append(" x").append(String.format("%,d", qty));
-                                }
-                                catch (NumberFormatException ignored)
-                                {
-                                }
+                                itemLine.append(", ");
                             }
+                            itemLine.append(itemManager.getItemComposition(id).getName()).append(" x").append(String.format("%,d", qty));
                         }
-                        out.println(itemLine.toString());
+                        catch (NumberFormatException ignored)
+                        {
+                        }
                     }
-                    out.println("----------------------------------------------------");
                 }
+                report.append(itemLine).append("\n");
             }
-
-            if (Desktop.isDesktopSupported())
-            {
-                Desktop.getDesktop().open(exportFile);
-            }
+            report.append("----------------------------------------------------\n");
         }
-        catch (IOException ex)
+
+        String payload = report.toString();
+        String defaultName = "Strafeous-Pace-Export-" + LocalDate.now().format(FILE_DATE_FORMAT) + ".txt";
+
+        Runnable exportTask = () ->
         {
-            JOptionPane.showMessageDialog(null, "Failed to export log: " + ex.getMessage(), PLUGIN_TITLE, JOptionPane.ERROR_MESSAGE);
+            try
+            {
+                Filepath dir = getPluginDirectory();
+                Filepath exportFile = dir.joinSegment(defaultName);
+                exportFile.write(payload.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+                SwingUtilities.invokeLater(() ->
+                        JOptionPane.showMessageDialog(
+                                null,
+                                "Exported " + entries.size() + " run(s) to:\n~/.runelite/plugin-data/strafeous-pace/" + defaultName,
+                                PLUGIN_TITLE,
+                                JOptionPane.INFORMATION_MESSAGE
+                        )
+                );
+            }
+            catch (IOException ex)
+            {
+                log.debug("Failed to export Strafeous' Pace log", ex);
+                SwingUtilities.invokeLater(() ->
+                        JOptionPane.showMessageDialog(null, "Failed to export log: " + ex.getMessage(), PLUGIN_TITLE, JOptionPane.ERROR_MESSAGE)
+                );
+            }
+        };
+
+        if (ioExecutor != null && !ioExecutor.isShutdown())
+        {
+            ioExecutor.execute(exportTask);
         }
     }
 
@@ -927,6 +958,7 @@ public class SkillPacePlugin extends Plugin
 
         if (!paused)
         {
+
             accumulatedTime = accumulatedTime.plus(Duration.between(startTime, Instant.now()));
             paused = true;
             autoPaused = false;
@@ -940,7 +972,6 @@ public class SkillPacePlugin extends Plugin
             autoPaused = false;
         }
     }
-
     public Duration getElapsed()
     {
         if (!running)
@@ -953,7 +984,6 @@ public class SkillPacePlugin extends Plugin
         }
         return accumulatedTime.plus(Duration.between(startTime, Instant.now()));
     }
-
     public static String formatDuration(long totalSeconds)
     {
         long hours = totalSeconds / 3600;
@@ -963,13 +993,11 @@ public class SkillPacePlugin extends Plugin
                 ? String.format("%02d:%02d:%02d", hours, minutes, seconds)
                 : String.format("%02d:%02d", minutes, seconds);
     }
-
     public static String formatHumanDuration(long totalSeconds)
     {
         long hours = totalSeconds / 3600;
         long minutes = (totalSeconds % 3600) / 60;
         long seconds = totalSeconds % 60;
-
         if (hours > 0)
         {
             return hours + (hours == 1 ? " hour " : " hours ") + minutes + (minutes == 1 ? " min" : " mins");
@@ -980,7 +1008,6 @@ public class SkillPacePlugin extends Plugin
         }
         return seconds + (seconds == 1 ? " second" : " seconds");
     }
-
     @Provides
     SkillPaceConfig provideConfig(ConfigManager configManager)
     {
